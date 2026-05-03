@@ -21,13 +21,21 @@ def normalizar(txt):
     return re.sub(r"\s+", " ", txt).upper().strip()
 
 if st.button("Consultar"):
-    url = f"https://dados.df.gov.br/dataset/portal-da-transparencia-remuneracao-dos-servidores/resource/remuneracao{mes}.csv"
+    url = f"https://www.dados.df.gov.br/dataset/portal-da-transparencia-remuneracao-dos-servidores"
 
-    try:
-        df = pd.read_csv(url)
-    except:
-        st.error("Não foi possível carregar os dados do mês informado.")
-        st.stop()
+   
+try:
+    df = pd.read_csv(
+        f"https://www.dados.df.gov.br/datastore/dump/"
+        f"?resource_id=portal-da-transparencia-remuneracao-dos-servidores"
+    )
+except:
+    st.error(
+        "Os dados deste mês ainda não foram publicados pelo Portal da Transparência do DF. "
+        "Tente um mês anterior, como 202503."
+    )
+    st.stop()
+
 
     df["NOME_NORM"] = df["nome_servidor"].astype(str).apply(normalizar)
     df["BRUTO"] = df["remuneracao_bruta"].fillna(0)
