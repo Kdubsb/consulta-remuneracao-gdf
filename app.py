@@ -1,14 +1,28 @@
-
+import csv
+import io
 import re
 import unicodedata
 import requests
 import pandas as pd
 import streamlit as st
 
-# Página do dataset (onde estão listados todos os meses e seus links de download)
-DATASET_PAGE = "https://www.dados.df.gov.br/dataset/portal-da-transparencia-remuneracao-dos-servidores"  # [5](https://www.dados.df.gov.br/dataset/portal-da-transparencia-remuneracao-dos-servidores)
+st.set_page_config(page_title="Remuneração GDF + Pontuação", layout="wide")
+st.title("Remuneração GDF (dados.df.gov.br) + Pontuação do Edital")
 
-st.title("Consulta de Remuneração – GDF (dados.df.gov.br)")
+# Exemplo real de CSV que existe (2026-02) no dados.df.gov.br:
+DEFAULT_CSV = "https://dados.df.gov.br/dataset/462126f8-8a61-4cec-91a2-38615b7f70f6/resource/426732b2-75f9-41a6-98e9-d3cf6b9ac6f6/download/remuneracao202602.csv"
+
+st.markdown(
+    "✅ Cole abaixo o **link CSV oficial** do mês (botão *download* no dados.df.gov.br). "
+    "Os arquivos do DF normalmente vêm separados por `;` (ponto e vírgula)."
+)
+
+csv_url = st.text_input("Link do CSV do mês (download)", value=DEFAULT_CSV)
+
+sal_min = st.number_input("Salário-mínimo vigente no edital (R$)", value=1412.0, min_value=0.0, step=1.0)
+
+st.write("Cole **um nome por linha**:")
+nomes_txt = st.text_area("Nomes", height=160)
 
 def normalizar(txt: str) -> str:
     if txt is None:
@@ -30,150 +44,150 @@ def pontuacao(total_bruto: float, salario_minimo: float) -> int:
     if sm <= 12: return 1000
     return 0
 
-@st.cache_data(ttl=3600)
-def listar_meses_e_links():
+def parse_num(s: str) -> float:
+    if s is None:
+        return 0.0
+    s = str(s).strip()
+    if not s:
+        return 0.0
+    # padrão BR: milhar '.' e decimal ','
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except:
+        return 0.0
+
+def baixar_stream(url: str):
     """
-    Lê a página do dataset e extrai todos os links do tipo:
-    .../download/remuneracaoYYYYMM.csv
+    Baixa CSV com requests e User-Agent de navegador (evita bloqueios do urllib).
     """
-    html = requests.get(DATASET_PAGE, timeout=30).text
-    # Captura links que terminam com remuneracaoYYYYMM.csv
-    # Pode aparecer como URL absoluta ou relativa
-    links = re.findall(r'(https?://[^\s"\']+?/download/remuneracao\d{6}\.csv|/dataset/[^\s"\']+?/download/remuneracao\d{6}\.csv)', html, flags=re.IGNORECASE)
-    meses = {}
-    for lk in links:
-        m = re.search(r"remuneracao(\d{6})\.csv", lk, flags=re.IGNORECASE)
-        if m:
-            mes = m.group(1)
-            url = lk
-            if url.startswith("/"):
-                url = "https://www.dados.df.gov.br" + url
-            meses[mes] = url  # se repetir, mantém o último encontrado
-    # ordena meses desc
-    meses_ordenados = dict(sorted(meses.items(), key=lambda x: x[0], reverse=True))
-    return meses_ordenados
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "text/csv,*/*;q=0.9",
+    }
+    r = requests.get(url, headers=headers, stream=True, timeout=180)
+    if r.status_code != 200:
+        raise RuntimeError(f"Falha ao baixar CSV. HTTP {r.status_code}. Verifique o link do CSV.")
+    r.encoding = "utf-8"
+    return r.iter_lines(decode_unicode=True)
 
-st.write("Cole um nome por linha:")
-nomes_txt = st.text_area("Nomes")
+def escolher_indices(header_norm):
+    """
+    Encontra índices relevantes no CSV do DF:
+    - Nome obrigatório (coluna NOME)
+    - Colunas de proventos para compor BRUTO (se não houver uma coluna 'BRUTA' explícita)
+    """
+    def idx(exato):
+        try:
+            return header_norm.index(exato)
+        except ValueError:
+            return None
 
-sal_min = st.number_input("Salário-mínimo do edital (R$)", value=1412.0)
+    i_nome = idx("NOME")
+    # tenta achar coluna explícita de bruto (se existir em algum mês/layout)
+    i_bruto = None
+    for cand in ["REMUNERACAO BRUTA", "REMUNERAÇÃO BRUTA", "TOTAL BRUTO", "BRUTO"]:
+        i_bruto = idx(cand)
+        if i_bruto is not None:
+            break
 
-# Descobre meses disponíveis automaticamente
-try:
-    meses_links = listar_meses_e_links()
-except Exception as e:
-    st.error(f"Não consegui acessar o dados.df.gov.br agora. Erro: {e}")
-    st.stop()
+    # rubricas comuns de rendimento (sem descontar IRRF/Seguridade)
+    rubricas = {
+        "REMUNERACAO BASICA", "REMUNERAÇÃO BÁSICA",
+        "BENEFICIOS", "BENEFÍCIOS",
+        "VALOR DA FUNCAO", "VALOR DA FUNÇÃO",
+        "COMISSAO CONSELHEIRO", "COMISSÃO CONSELHEIRO",
+        "HORA EXTRA",
+        "VERBAS EVENTUAIS",
+        "VERBAS JUDICIAIS",
+        "LICENCA PREMIO", "LICENÇA PRÊMIO",
+    }
+    rub_norm = {normalizar(x) for x in rubricas}
+    idx_rub = [i for i, h in enumerate(header_norm) if h in rub_norm]
 
-if not meses_links:
-    st.error("Não encontrei links de arquivos mensais (remuneracaoYYYYMM.csv) na página do dataset.")
-    st.stop()
+    return i_nome, i_bruto, idx_rub
 
-meses_disponiveis = list(meses_links.keys())
-mes_escolhido = st.selectbox("Mês disponível (YYYYMM)", meses_disponiveis, index=0)
-download_url = meses_links[mes_escolhido]
+col1, col2 = st.columns([1, 1])
+testar = col1.button("Testar link (mostrar 5 primeiras linhas)")
+consultar = col2.button("Consultar e calcular pontuação", type="primary")
 
-st.caption(f"Fonte (download): {download_url}")
+if testar:
+    try:
+        lines = baixar_stream(csv_url)
+        first = [next(lines) for _ in range(5)]
+        st.success("✅ Link OK! Abaixo 5 primeiras linhas do arquivo:")
+        st.code("\n".join(first))
+    except Exception as e:
+        st.error(str(e))
 
-def achar_coluna(df_cols, termos):
-    cols_norm = [(c, normalizar(c)) for c in df_cols]
-    for c, cn in cols_norm:
-        for t in termos:
-            if t in cn:
-                return c
-    return None
-
-if st.button("Consultar"):
+if consultar:
     nomes = [n.strip() for n in nomes_txt.splitlines() if n.strip()]
     if not nomes:
         st.error("Informe pelo menos um nome.")
         st.stop()
 
-    # Normaliza nomes para busca
     chaves = {n: normalizar(n) for n in nomes}
     totais = {n: 0.0 for n in nomes}
     detalhes = []
 
-    # Leitura em chunks para não estourar memória no Streamlit Cloud
-    # O CSV costuma ser separado por ';' [4](https://dados.df.gov.br/dataset/462126f8-8a61-4cec-91a2-38615b7f70f6/resource/d8ed1c6d-967b-4f3f-888a-605139251370/download/remuneracao202407.csv)
     try:
-        it = pd.read_csv(download_url, sep=";", dtype=str, encoding="utf-8", chunksize=200000)
-    except Exception:
-        it = pd.read_csv(download_url, sep=";", dtype=str, encoding="latin-1", chunksize=200000)
+        lines = baixar_stream(csv_url)
+        reader = csv.reader((ln for ln in lines if ln), delimiter=";")  # DF costuma usar ';' [1](https://dados.df.gov.br/dataset/462126f8-8a61-4cec-91a2-38615b7f70f6/resource/d8ed1c6d-967b-4f3f-888a-605139251370/download/remuneracao202407.csv)
+        header = next(reader)
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
-    # Na primeira iteração, descobrimos colunas relevantes
-    nome_col = None
-    bruto_col = None
+    header_norm = [normalizar(h) for h in header]
+    i_nome, i_bruto, idx_rub = escolher_indices(header_norm)
 
-    for chunk in it:
-        if nome_col is None:
-            nome_col = achar_coluna(chunk.columns, ["NOME"])
-            # tenta achar coluna explícita de bruto (se existir)
-            bruto_col = achar_coluna(chunk.columns, ["BRUTA", "BRUTO", "REMUNERACAO BRUTA", "REMUNERAÇÃO BRUTA", "TOTAL BRUTO", "TOTALBRUTO"])
-            if nome_col is None:
-                st.error("Não encontrei a coluna de NOME no CSV. Verifique o dicionário de dados do dataset.")
-                st.stop()
+    if i_nome is None:
+        st.error("Não encontrei a coluna 'NOME' no CSV. Verifique se o link é realmente de remuneração do DF.")
+        st.stop()
 
-        # Filtra linhas que contenham qualquer um dos nomes (normalizado)
-        chunk["_NOME_NORM"] = chunk[nome_col].map(normalizar)
+    # Processa linha a linha (não estoura memória)
+    for row in reader:
+        if len(row) <= i_nome:
+            continue
 
-        # Se tiver coluna BRUTA explícita, usa ela; senão tenta somar rubricas positivas comuns
-        if bruto_col:
-            bruto_raw = chunk[bruto_col].fillna("0").astype(str)
-            bruto_val = (bruto_raw.str.replace(".", "", regex=False)
-                                  .str.replace(",", ".", regex=False))
-            chunk["_BRUTO"] = pd.to_numeric(bruto_val, errors="coerce").fillna(0.0)
-        else:
-            # fallback: soma de rubricas mais comuns (ajusta se o CSV tiver nomes diferentes)
-            # OBS: como não há garantia de coluna "bruta" em todos os layouts,
-            # esse fallback tenta ser útil e transparente.
-            possiveis = [
-                "REMUNERACAO BASICA", "REMUNERAÇÃO BÁSICA", "BENEFICIOS", "BENEFÍCIOS",
-                "VALOR DA FUNCAO", "VALOR DA FUNÇÃO", "COMISSAO CONSELHEIRO", "COMISSÃO CONSELHEIRO",
-                "HORA EXTRA", "VERBAS EVENTUAIS", "VERBAS JUDICIAIS"
-            ]
-            soma = 0.0
-            for col in chunk.columns:
-                cn = normalizar(col)
-                if cn in [normalizar(x) for x in possiveis]:
-                    v = (chunk[col].fillna("0").astype(str)
-                                 .str.replace(".", "", regex=False)
-                                 .str.replace(",", ".", regex=False))
-                    soma += pd.to_numeric(v, errors="coerce").fillna(0.0)
-            chunk["_BRUTO"] = soma
+        nome_encontrado = row[i_nome]
+        nome_norm = normalizar(nome_encontrado)
 
+        # verifica se bate com algum nome informado
         for nome_in, chave in chaves.items():
-            sub = chunk[chunk["_NOME_NORM"].str.contains(chave, na=False)]
-            if not sub.empty:
-                total_sub = float(sub["_BRUTO"].sum())
-                totais[nome_in] += total_sub
-                # Guarda alguns detalhes (para auditoria)
-                for _, r in sub.head(50).iterrows():  # limita por chunk para não explodir
+            if chave and chave in nome_norm:
+                if i_bruto is not None and i_bruto < len(row):
+                    bruto = parse_num(row[i_bruto])
+                else:
+                    bruto = sum(parse_num(row[i]) for i in idx_rub if i < len(row))
+
+                totais[nome_in] += bruto
+
+                if len(detalhes) < 10000:
                     detalhes.append({
                         "nome_input": nome_in,
-                        "mes": mes_escolhido,
-                        "nome_encontrado": r.get(nome_col, ""),
-                        "bruto_linha": float(r.get("_BRUTO", 0.0))
+                        "nome_encontrado": nome_encontrado,
+                        "bruto_linha": bruto
                     })
 
-    # Mostra resultados
-    st.subheader("Resultado (por nome)")
+    # Monta resultado final
     saida = []
     for nome_in, total in totais.items():
         pts = pontuacao(total, float(sal_min))
         saida.append({
             "nome": nome_in,
-            "mes": mes_escolhido,
-            "total_bruto": total,
+            "total_bruto_somado": round(total, 2),
             "pontuacao": pts
         })
+
     df_out = pd.DataFrame(saida)
+    st.subheader("Resultado (por nome)")
     st.dataframe(df_out, use_container_width=True)
 
     st.download_button(
         "Baixar resultado (CSV)",
         df_out.to_csv(index=False).encode("utf-8"),
-        file_name=f"resultado_gdf_{mes_escolhido}.csv",
+        file_name="resultado_pontuacao_gdf.csv",
         mime="text/csv"
     )
 
@@ -184,13 +198,13 @@ if st.button("Consultar"):
     st.download_button(
         "Baixar detalhamento (CSV)",
         df_det.to_csv(index=False).encode("utf-8"),
-        file_name=f"detalhamento_gdf_{mes_escolhido}.csv",
+        file_name="detalhamento_gdf.csv",
         mime="text/csv"
     )
 
-    if not bruto_col:
+    if i_bruto is None:
         st.warning(
-            "⚠️ Não encontrei uma coluna explícita de 'remuneração bruta' no CSV deste mês. "
-            "Usei a soma de rubricas remuneratórias comuns (remuneração básica, benefícios, função, etc.). "
-            "Se você quiser 100% fiel ao layout do GDF, podemos ajustar conforme o dicionário de dados do dataset."
+            "⚠️ Este CSV não trouxe uma coluna explícita de 'BRUTO/TOTAL BRUTO'. "
+            "Então eu somei rubricas remuneratórias comuns (remuneração básica, benefícios, função, etc.). "
+            "Se você quiser, eu ajusto exatamente conforme o dicionário de dados do GDF."
         )
